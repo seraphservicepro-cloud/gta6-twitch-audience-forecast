@@ -154,6 +154,23 @@ def final_hour_signal(case, opening):
     return latest - opening, slope
 
 
+def audience_headroom(case, origin, launch_counts):
+    # Estimate how much audience Twitch had available during the first wave.
+    # Additional viewers can arrive for a major launch, so this is a soft bound.
+    target = case.get('game', {}).get('name', '').casefold()
+    market = []
+    for snapshot in case.get('categories_hourly') or []:
+        hour = (timestamp(snapshot['from']) - origin) / 3600
+        categories = snapshot.get('top') or []
+        if -12 <= hour <= 0 and len(categories) >= 12:
+            market.append(sum(row['viewers'] for row in categories if row['name'].casefold() != target))
+    if len(market) < 6:
+        return None
+    peak = max(count for hour, count in launch_counts.items() if -12 <= hour <= 0)
+    available = 1.22 * (peak + median(market))
+    return log_count(available)
+
+
 def predict(case):
     origin = timestamp(case['day_start'])
     counts = hourly_counts(case.get('history_hourly') or [], origin)
@@ -176,10 +193,15 @@ def predict(case):
             correction = 0.76 * amplitude * math.exp(-i / 2.1)
             values[i] = [value + correction for value in row]
 
+    headroom = audience_headroom(case, origin, counts)
     rows = []
     for hour, quantiles in enumerate(values, 2):
-        counts = [round(min(1_000_000_000, math.exp(max(0.0, min(CAP, opening + q)))), 4) for q in quantiles]
-        rows.append({'hour': hour, 'q': counts})
+        estimates = [opening + q for q in quantiles]
+        if headroom is not None:
+            strength = 0.65 * (1.0 - math.exp(-(hour - 1) / 5.0))
+            estimates = [value - strength * max(0.0, value - headroom) for value in estimates]
+        viewers = [round(min(1_000_000_000, math.exp(max(0.0, min(CAP, value)))), 4) for value in estimates]
+        rows.append({'hour': hour, 'q': viewers})
     return {'hours': rows}
 
 
