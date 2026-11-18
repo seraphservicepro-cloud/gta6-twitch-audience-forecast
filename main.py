@@ -19,10 +19,10 @@ def timestamp(value):
     return datetime.fromisoformat(value).timestamp()
 
 
-def hourly_counts(rows, origin):
+def hourly_counts(rows, origin, field='viewers'):
     return {
-        int((timestamp(row['from']) - origin) // 3600): row['viewers']
-        for row in rows if row.get('viewers') is not None
+        int((timestamp(row['from']) - origin) // 3600): row[field]
+        for row in rows if row.get(field) is not None
     }
 
 
@@ -34,6 +34,14 @@ def summarize(counts):
     recent = median(early) if early else opening
     previous = log_count(counts.get(-1, counts[0]))
     return opening, (opening - crest, opening - recent, opening - previous, opening)
+
+
+def summarize_channels(counts):
+    earlier = [log_count(counts[h]) for h in range(-10, -4) if h in counts]
+    if not counts.get(0) or len(earlier) < 3:
+        return None
+    opening = log_count(counts[0])
+    return opening, min(5.5, opening - median(earlier))
 
 
 def compatibility(launch):
@@ -55,13 +63,15 @@ def launch_examples(comparables):
         prior = compatibility(launch)
         if not prior:
             continue
-        counts = hourly_counts(launch['hourly'], timestamp(launch['day_start']))
+        origin = timestamp(launch['day_start'])
+        counts = hourly_counts(launch['hourly'], origin)
         if not counts.get(0) or sum(h in counts for h in range(-12, 0)) < 5:
             continue
         if sum(h in counts for h in range(1, 24)) != 23:
             continue
         opening, features = summarize(counts)
-        yield prior, features, tuple(log_count(counts[h]) - opening for h in range(1, 24))
+        channels = summarize_channels(hourly_counts(launch['hourly'], origin, 'channels'))
+        yield prior, features, channels, tuple(log_count(counts[h]) - opening for h in range(1, 24))
 
 
 def dot(left, right):
@@ -96,29 +106,41 @@ def weighted_quantile(values, level):
     return ordered[-1][0]
 
 
-def model(examples, target_features):
+def model(examples, target_features, target_channels):
+    # Channel participation is a more informative rollout signal for the
+    # largest launches, where pre-release audiences can already be substantial.
+    size = max(0.0, min(1.0, (target_features[3] - math.log(100_000)) / math.log(2.5)))
+    channel_strength = 0.4 + 0.5 * size
     design = []
-    for prior, features, curve in examples:
+    for prior, features, channels, curve in examples:
         differences = [a - b for a, b in zip(features, target_features)]
         size_gap = differences[3] / 1.55
         distance = sum((d / scale) ** 2 for d, scale in zip(differences[:3], (0.67, 0.52, 0.43)))
+        channel_size_gap = channel_growth_gap = 0.0
+        if channels is not None and target_channels is not None:
+            channel_size_gap = (channels[0] - target_channels[0]) / 1.4
+            channel_growth_gap = (channels[1] - target_channels[1]) / 1.2
+            distance += channel_strength * (channel_size_gap ** 2 + 2 * channel_growth_gap ** 2)
         # Don't drive every weight to zero for an unprecedented audience. The
         # size coefficient then extrapolates only over a bounded range.
         weight = prior / (1.0 + (distance + size_gap * size_gap) / 10.0) ** 2
         regressors = [1.0] + [max(-2.0, min(2.0, d)) for d in differences[:3]]
-        regressors.append(max(-1.65, min(1.65, size_gap)))
+        regressors.append(max(-2.5, min(2.5, size_gap)))
+        regressors.extend(max(-1.8, min(1.8, channel_strength * gap))
+                          for gap in (channel_size_gap, channel_growth_gap))
         design.append((weight, regressors, curve))
 
     total = sum(weight for weight, _, _ in design)
     design = [(weight / total, row, curve) for weight, row, curve in design]
-    penalty = (0.0, 0.28, 0.42, 0.48, 0.46)
+    penalty = (0.0, 0.28, 0.42, 0.48, 0.46, 0.50, 0.40)
+    columns = range(len(penalty))
     matrix = [[sum(w * row[i] * row[j] for w, row, _ in design) + (penalty[i] if i == j else 0.0)
-               for j in range(5)] for i in range(5)]
+               for j in columns] for i in columns]
 
     forecast = []
     centers = []
     for h in range(23):
-        rhs = [sum(w * row[i] * curve[h] for w, row, curve in design) for i in range(5)]
+        rhs = [sum(w * row[i] * curve[h] for w, row, curve in design) for i in columns]
         coefficients = solve(matrix, rhs)
         centers.append(coefficients[0])
         sigma = 0.075 + 0.035 * math.sqrt(h + 1)
@@ -173,14 +195,18 @@ def audience_headroom(case, origin, launch_counts):
 
 def predict(case):
     origin = timestamp(case['day_start'])
-    counts = hourly_counts(case.get('history_hourly') or [], origin)
+    history = case.get('history_hourly') or []
+    counts = hourly_counts(history, origin)
     known = case['known']
     first_hour = known if isinstance(known, dict) else next(row for row in known if row['hour'] == 1)
     counts[0] = first_hour['viewers']
     opening, features = summarize(counts)
     examples = list(launch_examples(case.get('comparables') or []))
     if examples:
-        values, centers = model(examples, features)
+        channels = hourly_counts(history, origin, 'channels')
+        if first_hour.get('channels') is not None:
+            channels[0] = first_hour['channels']
+        values, centers = model(examples, features, summarize_channels(channels))
     else:
         centers = [0.0] * 23
         values = [[z * 0.15 * math.sqrt(h) for z in NORMAL] for h in range(1, 24)]
