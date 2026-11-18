@@ -109,8 +109,12 @@ def weighted_quantile(values, level):
 def model(examples, target_features, target_channels):
     # Channel participation is a more informative rollout signal for the
     # largest launches, where pre-release audiences can already be substantial.
-    size = max(0.0, min(1.0, (target_features[3] - math.log(100_000)) / math.log(2.5)))
-    channel_strength = 0.4 + 0.5 * size
+    large_launch_weight = max(0.0, min(1.0, (target_features[3] - math.log(100_000)) / math.log(2.5)))
+    channel_strength = 0.4 + 0.5 * large_launch_weight
+    # At unusually large openings, give scale-matched cross-platform launches
+    # more weight and adjust their curves more strongly for the feature gaps.
+    platform_prior_power = 1.0 - 0.10 * large_launch_weight
+    scenario_adjustment = 0.85 + 0.25 * large_launch_weight
     design = []
     for prior, features, channels, curve in examples:
         differences = [a - b for a, b in zip(features, target_features)]
@@ -123,7 +127,7 @@ def model(examples, target_features, target_channels):
             distance += channel_strength * (channel_size_gap ** 2 + 2 * channel_growth_gap ** 2)
         # Don't drive every weight to zero for an unprecedented audience. The
         # size coefficient then extrapolates only over a bounded range.
-        weight = prior / (1.0 + (distance + size_gap * size_gap) / 10.0) ** 2
+        weight = prior ** platform_prior_power / (1.0 + (distance + size_gap * size_gap) / 10.0) ** 2
         regressors = [1.0] + [max(-2.0, min(2.0, d)) for d in differences[:3]]
         regressors.append(max(-2.5, min(2.5, size_gap)))
         regressors.extend(max(-1.8, min(1.8, channel_strength * gap))
@@ -147,7 +151,7 @@ def model(examples, target_features, target_channels):
         scenarios = []
         for weight, row, curve in design:
             effect = dot(row[1:], coefficients[1:])
-            adjusted = curve[h] - 0.85 * effect
+            adjusted = curve[h] - scenario_adjustment * effect
             # Smooth the discrete comparable distribution with a small normal
             # kernel. Long horizons retain the full between-launch dispersion.
             for z, probability in zip((-1.6, -0.75, 0, 0.75, 1.6), (0.10, 0.22, 0.36, 0.22, 0.10)):
