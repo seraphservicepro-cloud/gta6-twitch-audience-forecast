@@ -104,7 +104,7 @@ def model(examples, target_features):
         distance = sum((d / scale) ** 2 for d, scale in zip(differences[:3], (0.67, 0.52, 0.43)))
         # Don't drive every weight to zero for an unprecedented audience. The
         # size coefficient then extrapolates only over a bounded range.
-        weight = prior / (1.0 + (distance + size_gap * size_gap) / 4.0) ** 2
+        weight = prior / (1.0 + (distance + size_gap * size_gap) / 10.0) ** 2
         regressors = [1.0] + [max(-2.0, min(2.0, d)) for d in differences[:3]]
         regressors.append(max(-1.65, min(1.65, size_gap)))
         design.append((weight, regressors, curve))
